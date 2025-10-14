@@ -1,8 +1,8 @@
-name: "Autoapproval"
-description: "Probot application for approving pull requests"
-author: "Dmytro Khmelenko"
+name: "Reasonable Autoapprover"
+description: "Auto approve PRs if a specific reason is given"
+author: "Jeff An"
 runs:
-  using: "node16"
+  using: "node20"
   main: "dist/index.js"
 outputs:
   approved:
