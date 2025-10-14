@@ -54,9 +54,24 @@ jobs:
     runs-on: ubuntu-latest
     name: Autoapproval
     steps:
-      - uses: dkhmelenko/autoapproval@v1.0
+      - id: autoapproval
+        uses: dkhmelenko/autoapproval@v1.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: Slack notify on successful auto-approve
+      # Requires a Slack Webhook for #security-alerts in secret SECURITY_ALERTS_SLACK_WEBHOOK
+      - name: Notify Slack (security-alerts)
+        if: steps.autoapproval.outputs.approved == 'true'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SECURITY_ALERTS_SLACK_WEBHOOK }}
+          SLACK_CHANNEL: security-alerts
+          SLACK_USERNAME: Auto Approval Bot
+          SLACK_COLOR: '#36a64f'
+          SLACK_MESSAGE: >-
+            Auto-approved PR by ${{ steps.autoapproval.outputs.pr_author }}:
+            ${{ steps.autoapproval.outputs.auto_approve_reason }}
 ```
 
 ## Configuration
@@ -151,6 +166,21 @@ _NOTES_:
 - the `Allow auto-merge` setting must be enabled for the repository.
 - it is enough to use only one of the options: `auto_merge_labels`, `auto_squash_merge_labels` or `auto_rebase_merge_labels`
 - the repository should have enabled the merge method
+
+---
+
+### Additional Requirement: PR Description Reason
+This action only approves a pull request if its description contains a line with a non-empty reason, in the format:
+
+```
+auto-approve reason: <your non-empty reason here>
+```
+
+When approval happens, the action exposes outputs you can use in later steps:
+
+- `approved`: 'true' or 'false'
+- `auto_approve_reason`: the extracted reason text
+- `pr_author`: the PR author's login
 
 
 ## Releasing

@@ -1,5 +1,6 @@
 import { Probot, Context } from 'probot'
 import { PullRequestEvent, PullRequestReviewEvent } from '@octokit/webhooks-types'
+import fs from 'fs'
 
 module.exports = (app: Probot) => {
   app.on(['pull_request.opened', 'pull_request.reopened', 'pull_request.labeled', 'pull_request.edited', 'pull_request_review'], async (context) => {
@@ -8,6 +9,11 @@ module.exports = (app: Probot) => {
     const pr = context.payload.pull_request
     context.log('PR: %s', pr.html_url)
     context.log('Action: %s', context.payload.action)
+
+    // initialize default outputs for the GitHub Action
+    setActionOutput('approved', 'false')
+    setActionOutput('auto_approve_reason', '')
+    setActionOutput('pr_author', pr.user.login || '')
 
     // NOTE(dabrady) When a PR is first opened, it can fire several different kinds of events if the author e.g. requests
     // reviewers or adds labels during creation. This triggers parallel runs of our GitHub App, so we need to filter out
@@ -56,6 +62,13 @@ module.exports = (app: Probot) => {
       requiredLabelsSatisfied = missingRequiredLabels.length === 0
     }
 
+    // extract the auto-approve reason from PR description
+    const reason = extractAutoApproveReason(pr.body || '')
+    if (!reason) {
+      context.log('Missing required "auto-approve reason: <text>" in PR description. Skipping approval.')
+      return
+    }
+
     if (requiredLabelsSatisfied && ownerSatisfied) {
       const reviews = await getAutoapprovalReviews(context)
 
@@ -65,12 +78,16 @@ module.exports = (app: Probot) => {
           await applyAutoMerge(context, prLabels, config.auto_merge_labels, config.auto_rebase_merge_labels, config.auto_squash_merge_labels)
           approvePullRequest(context)
           applyLabels(context, config.apply_labels as string[])
+          setActionOutput('approved', 'true')
+          setActionOutput('auto_approve_reason', reason)
           context.log('Review was dismissed, approve again')
         }
       } else {
         await applyAutoMerge(context, prLabels, config.auto_merge_labels, config.auto_rebase_merge_labels, config.auto_squash_merge_labels)
         approvePullRequest(context)
         applyLabels(context, config.apply_labels as string[])
+        setActionOutput('approved', 'true')
+        setActionOutput('auto_approve_reason', reason)
         context.log('PR approved first time')
       }
     } else {
@@ -139,4 +156,29 @@ async function getAutoapprovalReviews (context: Context): Promise<any> {
   const autoapprovalReviews = (reviews.data).filter((item: any) => item.user.login === 'autoapproval[bot]')
 
   return autoapprovalReviews
+}
+
+function extractAutoApproveReason (body: string): string | null {
+  const lines = body.split(/\r?\n/)
+  for (const line of lines) {
+    const match = line.match(/^auto-approve reason:\s*(.+)\s*$/i)
+    if (match && match[1] && match[1].trim().length > 0) {
+      return match[1].trim()
+    }
+  }
+  return null
+}
+
+function setActionOutput (name: string, value: string) {
+  const ghOutput = process.env.GITHUB_OUTPUT
+  if (!ghOutput) return
+  // Use multiline-safe syntax to avoid issues with special characters
+  const delimiter = 'EOF_' + name
+  try {
+    fs.appendFileSync(ghOutput, `${name}<<${delimiter}\n${value}\n${delimiter}\n`)
+  } catch (e) {
+    // best-effort; log and continue
+    // @ts-ignore
+    console.error('Failed to write action output', name, e)
+  }
 }

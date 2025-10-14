@@ -4,6 +4,13 @@ author: "Dmytro Khmelenko"
 runs:
   using: "node16"
   main: "dist/index.js"
+outputs:
+  approved:
+    description: "Whether the PR was auto-approved ('true'|'false')"
+  auto_approve_reason:
+    description: "Extracted reason from PR body ('auto-approve reason: ...')"
+  pr_author:
+    description: "Login of the PR author"
 branding:
   icon: "arrow-right"
   color: "green"
