@@ -2,6 +2,8 @@ import { Probot, Context } from 'probot'
 import { PullRequestEvent, PullRequestReviewEvent } from '@octokit/webhooks-types'
 import fs from 'fs'
 
+const blacklistedStrings = ['do-not-merge', "dnl", 'wip']
+
 module.exports = (app: Probot) => {
   app.on(['pull_request.opened', 'pull_request.reopened', 'pull_request.labeled', 'pull_request.edited', 'pull_request_review'], async (context) => {
     context.log('Repo: %s', context.payload.repository.full_name)
@@ -31,36 +33,53 @@ module.exports = (app: Probot) => {
     const config: any = await context.config('autoapproval.yml')
     context.log(config, '\n\nLoaded config')
 
+    const prTitle = (pr.title || '').toLowerCase()
+    const blacklistedInTitle = blacklistedStrings.filter((s: string) => prTitle.includes(s.toLowerCase()))
+    if (blacklistedInTitle.length > 0) {
+      context.log('PR title contains blacklisted term(s): %s', blacklistedInTitle)
+      return
+    }
+
     // determine if the PR has any "blacklisted" labels
     const prLabels: string[] = pr.labels.map((label: any) => label.name)
-    let blacklistedLabels: string[] = []
-    if (config.blacklisted_labels !== undefined) {
-      blacklistedLabels = config.blacklisted_labels
-        .filter((blacklistedLabel: any) => prLabels.includes(blacklistedLabel))
+    const blacklistedLabels = blacklistedStrings
+        .filter((blacklistedLabel: string) => prLabels.includes(blacklistedLabel))
 
-      // if PR contains any black listed labels, do not proceed further
-      if (blacklistedLabels.length > 0) {
-        context.log('PR black listed from approving: %s', blacklistedLabels)
-        return
-      }
+    // if PR contains any black listed labels, do not proceed further
+    if (blacklistedLabels.length > 0) {
+      context.log('PR black listed from approving: %s', blacklistedLabels)
+      return
     }
 
-    // reading pull request owner info and check it with configuration
-    const ownerSatisfied = config.from_owner.length === 0 || config.from_owner.includes(pr.user.login)
-
-    // reading pull request labels and check them with configuration
-    let requiredLabelsSatisfied
-    if (config.required_labels_mode === 'one_of') {
-      // one of the required_labels needs to be applied
-      const appliedRequiredLabels = config.required_labels
-        .filter((requiredLabel: any) => prLabels.includes(requiredLabel))
-      requiredLabelsSatisfied = appliedRequiredLabels.length > 0
-    } else {
-      // all of the required_labels need to be applied
-      const missingRequiredLabels = config.required_labels
-        .filter((requiredLabel: any) => !prLabels.includes(requiredLabel))
-      requiredLabelsSatisfied = missingRequiredLabels.length === 0
+    const prParamsForReviews = context.pullRequest()
+    const allReviewsResponse = await context.octokit.pulls.listReviews(prParamsForReviews)
+    const allReviews = allReviewsResponse.data
+    if (allReviews.some((r: any) => r.state === 'APPROVED') && context.payload.action !== 'dismissed') {
+      context.log('PR already has approvals from at least one reviewer. Skipping auto-approval.')
+      return
     }
+
+    // // reading pull request owner info and check it with configuration
+    // const ownerSatisfied = config.from_owner.length === 0 || config.from_owner.includes(pr.user.login)
+
+    // // reading pull request labels and check them with configuration
+    // let requiredLabelsSatisfied
+    // if (config.required_labels_mode === 'one_of') {
+    //   // one of the required_labels needs to be applied
+    //   const appliedRequiredLabels = config.required_labels
+    //     .filter((requiredLabel: any) => prLabels.includes(requiredLabel))
+    //   requiredLabelsSatisfied = appliedRequiredLabels.length > 0
+    // } else {
+    //   // all of the required_labels need to be applied
+    //   const missingRequiredLabels = config.required_labels
+    //     .filter((requiredLabel: any) => !prLabels.includes(requiredLabel))
+    //   requiredLabelsSatisfied = missingRequiredLabels.length === 0
+    // }
+    // if (!requiredLabelsSatisfied || !ownerSatisfied) {
+    //   context.log('PR does not meet approval criteria')
+    //   context.log('Condition failed! \n - missing required labels: %s\n - PR owner found: %s', requiredLabelsSatisfied, ownerSatisfied)
+    //   return
+    // }
 
     // extract the auto-approve reason from PR description
     const reason = extractAutoApproveReason(pr.body || '')
@@ -69,30 +88,22 @@ module.exports = (app: Probot) => {
       return
     }
 
-    if (requiredLabelsSatisfied && ownerSatisfied) {
-      const reviews = await getAutoapprovalReviews(context)
+    const autoapprovalReviews = allReviews.filter((item: any) => item.user.login === 'autoapproval[bot]')
 
-      if (reviews.length > 0) {
-        context.log('PR has already reviews')
-        if (context.payload.action === 'dismissed') {
-          await applyAutoMerge(context, prLabels, config.auto_merge_labels, config.auto_rebase_merge_labels, config.auto_squash_merge_labels)
-          approvePullRequest(context)
-          applyLabels(context, config.apply_labels as string[])
-          setActionOutput('approved', 'true')
-          setActionOutput('auto_approve_reason', reason)
-          context.log('Review was dismissed, approve again')
-        }
-      } else {
-        await applyAutoMerge(context, prLabels, config.auto_merge_labels, config.auto_rebase_merge_labels, config.auto_squash_merge_labels)
+    if (autoapprovalReviews.length > 0) {
+      context.log('PR has already reviews')
+      if (context.payload.action === 'dismissed') {
         approvePullRequest(context)
-        applyLabels(context, config.apply_labels as string[])
         setActionOutput('approved', 'true')
         setActionOutput('auto_approve_reason', reason)
-        context.log('PR approved first time')
+        context.log('Review was dismissed, approve again')
       }
     } else {
-      // one of the checks failed
-      context.log('Condition failed! \n - missing required labels: %s\n - PR owner found: %s', requiredLabelsSatisfied, ownerSatisfied)
+      approvePullRequest(context)
+      applyLabels(context, ["auto_approved"])
+      setActionOutput('approved', 'true')
+      setActionOutput('auto_approve_reason', reason)
+      context.log('PR approved first time')
     }
   })
 }
@@ -109,53 +120,6 @@ async function applyLabels (context: Context, labels: string[]) {
     const labelsParam = context.issue({ labels: labels })
     await context.octokit.issues.addLabels(labelsParam)
   }
-}
-
-function applyAutoMerge (context: Context, prLabels: string[], mergeLabels: string[], rebaseLabels: string[], squashLabels: string[]) {
-  if (mergeLabels && prLabels.filter((label: any) => mergeLabels.includes(label)).length > 0) {
-    enableAutoMerge(context, 'MERGE')
-  }
-  if (rebaseLabels && prLabels.filter((label: any) => rebaseLabels.includes(label)).length > 0) {
-    enableAutoMerge(context, 'REBASE')
-  }
-  if (squashLabels && prLabels.filter((label: any) => squashLabels.includes(label)).length > 0) {
-    enableAutoMerge(context, 'SQUASH')
-  }
-}
-
-const enableAutoMergeMutation = `
-  mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
-    enablePullRequestAutoMerge(input:{
-      pullRequestId: $pullRequestId,
-      mergeMethod: $mergeMethod
-    }) {
-      pullRequest {
-        id,
-        autoMergeRequest {
-          mergeMethod
-        }
-      }
-    }
-  }
-`
-
-async function enableAutoMerge (context: Context, method: string) {
-  context.log('Auto merging with merge method %s', method)
-  const payload = context.payload as PullRequestEvent | PullRequestReviewEvent
-
-  await context.octokit.graphql(enableAutoMergeMutation, {
-    pullRequestId: payload.pull_request.node_id,
-    mergeMethod: method
-  })
-}
-
-async function getAutoapprovalReviews (context: Context): Promise<any> {
-  const pr = context.pullRequest()
-  const reviews = await context.octokit.pulls.listReviews(pr)
-
-  const autoapprovalReviews = (reviews.data).filter((item: any) => item.user.login === 'autoapproval[bot]')
-
-  return autoapprovalReviews
 }
 
 function extractAutoApproveReason (body: string): string | null {
