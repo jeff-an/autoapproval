@@ -1,5 +1,4 @@
 import { Probot, Context } from 'probot'
-import { PullRequestEvent, PullRequestReviewEvent } from '@octokit/webhooks-types'
 import fs from 'fs'
 
 const blacklistedStrings = ['do-not-merge', "dnl", 'wip']
@@ -34,14 +33,14 @@ module.exports = (app: Probot) => {
     context.log(config, '\n\nLoaded config')
 
     const prTitle = (pr.title || '').toLowerCase()
-    const blacklistedInTitle = blacklistedStrings.filter((s: string) => prTitle.includes(s.toLowerCase()))
+    const blacklistedInTitle = blacklistedStrings.filter((s: string) => prTitle.toLowerCase().includes(`${s.toLowerCase()}`))
     if (blacklistedInTitle.length > 0) {
       context.log('PR title contains blacklisted term(s): %s', blacklistedInTitle)
       return
     }
 
     // determine if the PR has any "blacklisted" labels
-    const prLabels: string[] = pr.labels.map((label: any) => label.name)
+    const prLabels: string[] = pr.labels.map((label: any) => label.name.toLowerCase())
     const blacklistedLabels = blacklistedStrings
         .filter((blacklistedLabel: string) => prLabels.includes(blacklistedLabel))
 
