@@ -1,7 +1,7 @@
 import { Probot, Context } from 'probot'
 import fs from 'fs'
 
-const blacklistedStrings = ['do-not-merge', "dnl", 'wip']
+const blacklistedStrings = ['[do-not-merge]', "[dnl]", '[wip]']
 
 module.exports = (app: Probot) => {
   app.on(['pull_request.opened', 'pull_request.reopened', 'pull_request.labeled', 'pull_request.edited', 'pull_request_review'], async (context) => {
