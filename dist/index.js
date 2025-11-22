@@ -145576,7 +145576,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 var fs_1 = __importDefault(__nccwpck_require__(79896));
-var blacklistedStrings = ['do-not-merge', "dnl", 'wip'];
+var blacklistedStrings = ['[do-not-merge]', "[dnl]", '[wip]'];
 module.exports = function (app) {
     app.on(['pull_request.opened', 'pull_request.reopened', 'pull_request.labeled', 'pull_request.edited', 'pull_request_review'], function (context) { return __awaiter(void 0, void 0, void 0, function () {
         var pr, config, prTitle, blacklistedInTitle, prLabels, blacklistedLabels, prParamsForReviews, allReviewsResponse, allReviews, reason, autoapprovalReviews;
