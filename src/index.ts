@@ -1,7 +1,13 @@
 import { Probot, Context } from 'probot'
 import fs from 'fs'
 
-const blacklistedStrings = ['[do-not-merge]', "[dnl]", '[wip]']
+const blacklistedStrings = ['[do-not-merge]', '[dnl]', '[wip]']
+const autoapprovalBotLogin = 'autoapproval[bot]'
+const agentNameIndicators = ['devin', 'cursor', 'claude', 'codex']
+const agentBranchPrefixes = agentNameIndicators.map((name) => `${name}/`)
+const requiredApprovalsForAgentPr = 2
+const changesRequestedReviewState = 'CHANGES_REQUESTED'
+const approvedReviewState = 'APPROVED'
 
 module.exports = (app: Probot) => {
   app.on(['pull_request.opened', 'pull_request.reopened', 'pull_request.labeled', 'pull_request.edited', 'pull_request_review'], async (context) => {
@@ -42,7 +48,7 @@ module.exports = (app: Probot) => {
     // determine if the PR has any "blacklisted" labels
     const prLabels: string[] = pr.labels.map((label: any) => label.name.toLowerCase())
     const blacklistedLabels = blacklistedStrings
-        .filter((blacklistedLabel: string) => prLabels.includes(blacklistedLabel))
+      .filter((blacklistedLabel: string) => prLabels.includes(blacklistedLabel))
 
     // if PR contains any black listed labels, do not proceed further
     if (blacklistedLabels.length > 0) {
@@ -53,10 +59,15 @@ module.exports = (app: Probot) => {
     const prParamsForReviews = context.pullRequest()
     const allReviewsResponse = await context.octokit.pulls.listReviews(prParamsForReviews)
     const allReviews = allReviewsResponse.data
-    if (allReviews.some((r: any) => r.state === 'APPROVED') && context.payload.action !== 'dismissed') {
-      context.log('PR already has approvals from at least one reviewer. Skipping auto-approval.')
-      return
-    }
+    const latestReviewsByUser = getLatestReviewsByUser(allReviews)
+    const isAgentGenerated = await isAgentGeneratedPullRequest(context, pr)
+    const reviewerApprovals = countNonBotApprovalsExcludingAutoapproval(latestReviewsByUser)
+    const needsAgentReviewBlock = isAgentGenerated && reviewerApprovals < requiredApprovalsForAgentPr
+    const hasAnyAutoapprovalReview = allReviews.some((review: any) => review?.user?.login === autoapprovalBotLogin)
+    const hasAnyAutoapprovalApproval = allReviews.some((review: any) => {
+      return review?.user?.login === autoapprovalBotLogin && (review?.state || '').toUpperCase() === approvedReviewState
+    })
+    let latestAutoapprovalReviewState = ((latestReviewsByUser.get(autoapprovalBotLogin)?.state || '') as string).toUpperCase()
 
     // // reading pull request owner info and check it with configuration
     // const ownerSatisfied = config.from_owner.length === 0 || config.from_owner.includes(pr.user.login)
@@ -84,25 +95,37 @@ module.exports = (app: Probot) => {
     const reason = extractAutoApproveReason(pr.body || '')
     if (!reason) {
       context.log('Missing required "auto-approve reason: <text>" in PR description. Skipping approval.')
-      return
-    }
+    } else {
+      const shouldApproveWhileBlocked = needsAgentReviewBlock && !hasAnyAutoapprovalApproval
+      const shouldApproveNormally = !needsAgentReviewBlock && (latestAutoapprovalReviewState !== approvedReviewState || context.payload.action === 'dismissed')
 
-    const autoapprovalReviews = allReviews.filter((item: any) => item.user.login === 'autoapproval[bot]')
-
-    if (autoapprovalReviews.length > 0) {
-      context.log('PR has already reviews')
-      if (context.payload.action === 'dismissed') {
-        approvePullRequest(context)
+      if (shouldApproveWhileBlocked || shouldApproveNormally) {
+        await approvePullRequest(context)
+        latestAutoapprovalReviewState = approvedReviewState
+        if (!hasAnyAutoapprovalReview) {
+          await applyLabels(context, ['auto_approved'])
+        }
         setActionOutput('approved', 'true')
         setActionOutput('auto_approve_reason', reason)
-        context.log('Review was dismissed, approve again')
+
+        if (context.payload.action === 'dismissed') {
+          context.log('Review was dismissed, approve again')
+        } else {
+          context.log('PR approved')
+        }
+      } else {
+        context.log('PR already has an active autoapproval approval review')
       }
-    } else {
-      approvePullRequest(context)
-      applyLabels(context, ["auto_approved"])
-      setActionOutput('approved', 'true')
-      setActionOutput('auto_approve_reason', reason)
-      context.log('PR approved first time')
+    }
+
+    if (needsAgentReviewBlock) {
+      if (latestAutoapprovalReviewState !== changesRequestedReviewState) {
+        await requestChangesOnPullRequest(context, reviewerApprovals)
+        latestAutoapprovalReviewState = changesRequestedReviewState
+      }
+      context.log('Agent-generated PR is blocked: %d/%d required non-bot approvals from other reviewers.', reviewerApprovals, requiredApprovalsForAgentPr)
+    } else if (isAgentGenerated) {
+      context.log('Agent-generated PR has enough non-bot approvals from other reviewers: %d/%d.', reviewerApprovals, requiredApprovalsForAgentPr)
     }
   })
 }
@@ -112,11 +135,17 @@ async function approvePullRequest (context: Context) {
   await context.octokit.pulls.createReview(prParams)
 }
 
+async function requestChangesOnPullRequest (context: Context, reviewerApprovals: number) {
+  const body = `This PR appears to be generated by a coding agent. It requires ${requiredApprovalsForAgentPr} non-bot approvals from other reviewers before merge. Current non-bot approvals: ${reviewerApprovals}.`
+  const prParams = context.pullRequest({ event: 'REQUEST_CHANGES' as const, body })
+  await context.octokit.pulls.createReview(prParams)
+}
+
 async function applyLabels (context: Context, labels: string[]) {
   // if there are labels required to be added, add them
   if (labels.length > 0) {
     // trying to apply existing labels to PR. If labels didn't exist, this call will fail
-    const labelsParam = context.issue({ labels: labels })
+    const labelsParam = context.issue({ labels })
     await context.octokit.issues.addLabels(labelsParam)
   }
 }
@@ -130,6 +159,75 @@ function extractAutoApproveReason (body: string): string | null {
     }
   }
   return null
+}
+
+async function isAgentGeneratedPullRequest (context: Context, pr: any): Promise<boolean> {
+  const branchName = (pr?.head?.ref || '').toLowerCase()
+  if (agentBranchPrefixes.some((prefix) => branchName.startsWith(prefix))) {
+    return true
+  }
+
+  if (!pr?.head?.ref) {
+    return false
+  }
+
+  const commits = await context.octokit.paginate(context.octokit.pulls.listCommits, context.pullRequest({ per_page: 100 }))
+  return commits.some(commitHasAgentCoAuthor)
+}
+
+function commitHasAgentCoAuthor (commit: any): boolean {
+  const commitMessage = commit?.commit?.message
+  if (!commitMessage) {
+    return false
+  }
+
+  for (const line of commitMessage.split(/\r?\n/)) {
+    const match = line.match(/^co-authored-by:\s*(.+?)\s*<[^>]+>\s*$/i)
+    if (!match || !match[1]) {
+      continue
+    }
+
+    const coAuthorName = match[1].trim().toLowerCase()
+    const hasBotSuffix = coAuthorName.includes('[bot]')
+    const hasAgentIndicator = agentNameIndicators.some((name) => coAuthorName.includes(name))
+    if (hasBotSuffix && hasAgentIndicator) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function getLatestReviewsByUser (reviews: any[]): Map<string, any> {
+  const latestReviewsByUser = new Map<string, any>()
+  for (const review of reviews) {
+    const login = review?.user?.login
+    if (!login) {
+      continue
+    }
+    latestReviewsByUser.set(login, review)
+  }
+  return latestReviewsByUser
+}
+
+function countNonBotApprovalsExcludingAutoapproval (latestReviewsByUser: Map<string, any>): number {
+  let count = 0
+  latestReviewsByUser.forEach((review, login) => {
+    if (login === autoapprovalBotLogin) {
+      return
+    }
+
+    const isBot = review?.user?.type === 'Bot' || login.toLowerCase().endsWith('[bot]')
+    if (isBot) {
+      return
+    }
+
+    if ((review?.state || '').toUpperCase() === 'APPROVED') {
+      count += 1
+    }
+  })
+
+  return count
 }
 
 function setActionOutput (name: string, value: string) {

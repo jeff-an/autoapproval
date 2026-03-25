@@ -43,7 +43,7 @@ on:
   pull_request:
     types: [opened, reopened, labeled, edited]
   pull_request_review:
-    types: [dismissed]
+    types: [submitted, dismissed]
     
 permissions:
   contents: read
